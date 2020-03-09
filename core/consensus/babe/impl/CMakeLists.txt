@@ -13,6 +13,14 @@ target_link_libraries(babe_lottery
     logger
     )
 
+add_library(babe_digests_util
+    babe_digests_util.cpp
+    )
+target_link_libraries(babe_digests_util
+    primitives
+    scale
+    )
+
 add_library(babe
     babe_impl.cpp
     babe_impl.hpp
@@ -30,11 +38,10 @@ target_link_libraries(babe
     primitives
     )
 
-add_library(babe_observer
-    babe_observer_impl.cpp
-    babe_observer_impl.hpp
+add_library(babe_synchronizer
+    babe_synchronizer_impl.cpp
     )
-target_link_libraries(babe_observer
-    babe
+target_link_libraries(babe_synchronizer
     logger
+    primitives
     )

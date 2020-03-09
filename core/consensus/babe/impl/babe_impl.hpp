@@ -6,6 +6,8 @@
 #ifndef KAGOME_BABE_IMPL_HPP
 #define KAGOME_BABE_IMPL_HPP
 
+#include "consensus/babe.hpp"
+
 #include <memory>
 
 #include <boost/asio/basic_waitable_timer.hpp>
@@ -14,17 +16,23 @@
 #include "blockchain/block_tree.hpp"
 #include "clock/timer.hpp"
 #include "common/logger.hpp"
-#include "consensus/babe.hpp"
 #include "consensus/babe/babe_lottery.hpp"
+#include "consensus/babe/babe_synchronizer.hpp"
+#include "consensus/babe/epoch_storage.hpp"
+#include "consensus/validation/babe_block_validator.hpp"
 #include "crypto/hasher.hpp"
 #include "crypto/sr25519_types.hpp"
 #include "libp2p/event/bus.hpp"
 #include "network/babe_gossiper.hpp"
+#include "network/babe_observer.hpp"
+#include "primitives/babe_configuration.hpp"
 #include "primitives/common.hpp"
+#include "runtime/core.hpp"
 
 namespace kagome::consensus {
-  inline const auto kBabeEngineId =
-      primitives::ConsensusEngineId::fromString("BABE").value();
+
+  enum class BabeState { START, CATCHING_UP, NEED_SLOT_TIME, SYNCHRONIZED };
+
   inline const auto kTimestampId =
       primitives::InherentIdentifier::fromString("timstap0").value();
   inline const auto kBabeSlotId =
@@ -38,7 +46,9 @@ namespace kagome::consensus {
         libp2p::event::channel_decl<BabeError, std::error_code>;
   }  // namespace event
 
-  class BabeImpl : public Babe, public std::enable_shared_from_this<BabeImpl> {
+  class BabeImpl : public Babe,
+                   public network::BabeObserver,
+                   public std::enable_shared_from_this<BabeImpl> {
    public:
     /**
      * Create an instance of Babe implementation
@@ -55,6 +65,10 @@ namespace kagome::consensus {
      * @param event_bus to deliver events over
      */
     BabeImpl(std::shared_ptr<BabeLottery> lottery,
+             std::shared_ptr<BabeSynchronizer> babe_synchronizer,
+             std::shared_ptr<BabeBlockValidator> block_validator,
+             std::shared_ptr<EpochStorage> epoch_storage,
+             std::shared_ptr<runtime::Core> core,
              std::shared_ptr<authorship::Proposer> proposer,
              std::shared_ptr<blockchain::BlockTree> block_tree,
              std::shared_ptr<network::BabeGossiper> gossiper,
@@ -71,6 +85,8 @@ namespace kagome::consensus {
                   BabeTimePoint starting_slot_finish_time) override;
 
     BabeMeta getBabeMeta() const override;
+
+    void onBlockAnnounce(const network::BlockAnnounce &announce) override;
 
    private:
     /**
@@ -94,19 +110,33 @@ namespace kagome::consensus {
      */
     void finishEpoch();
 
-    /**
-     * To be called if we are far behind other nodes to skip some slots and
-     * finally synchronize with the network
-     */
-    void synchronizeSlots();
+    void processNextBlock(const primitives::Block &block);
 
-   private:
     outcome::result<primitives::PreRuntime> babePreDigest(
         const crypto::VRFOutput &output) const;
 
     primitives::Seal sealBlock(const primitives::Block &block) const;
 
+    Epoch epochForChildOf(const primitives::BlockHash &parent_hash,
+                          primitives::BlockNumber parent_number,
+                          BabeSlotNumber slot_number) const;
+
+    /**
+     * To be called if we are far behind other nodes to skip some slots and
+     * finally synchronize with the network
+     */
+    void synchronizeSlots(const primitives::Block &new_block);
+
+    void synchronizeBlocks(const primitives::Block &new_block,
+                           std::function<void()> next);
+    outcome::result<void> applyBlock(const primitives::Block &block);
+
+   private:
     std::shared_ptr<BabeLottery> lottery_;
+    std::shared_ptr<BabeSynchronizer> babe_synchronizer_;
+    std::shared_ptr<BabeBlockValidator> block_validator_;
+    std::shared_ptr<EpochStorage> epoch_storage_;
+    std::shared_ptr<runtime::Core> core_;
     std::shared_ptr<authorship::Proposer> proposer_;
     std::shared_ptr<blockchain::BlockTree> block_tree_;
     std::shared_ptr<network::BabeGossiper> gossiper_;
@@ -117,7 +147,18 @@ namespace kagome::consensus {
     std::unique_ptr<clock::Timer> timer_;
     libp2p::event::Bus &event_bus_;
 
+    primitives::BabeConfiguration genesis_configuration_;
+
+    BabeState current_state_;
+
     Epoch current_epoch_;
+
+    /// Estimates of the first block production slot time. Input for the median
+    /// algorithm
+    std::vector<uint64_t> first_slot_times_{};
+
+    /// Number of blocks we need to use in median algorithm to get the slot time
+    const uint32_t kSlotTail = 10;
 
     BabeSlotNumber current_slot_{};
     BabeLottery::SlotsLeadership slots_leadership_;

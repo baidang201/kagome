@@ -101,7 +101,7 @@ namespace kagome::network {
           return false;
         }
         log_->info("Received block announce: block number {}",
-                   msg_res.value().header.number);
+                   msg_res.value().block.number);
         babe_observer_->onBlockAnnounce(msg_res.value());
         return true;
       }

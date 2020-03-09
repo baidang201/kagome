@@ -5,12 +5,14 @@
 
 #include "consensus/babe/impl/babe_impl.hpp"
 
-#include <cmath>
-
 #include <sr25519/sr25519.h>
 #include <boost/assert.hpp>
+#include <boost/range/join.hpp>
+
 #include "common/buffer.hpp"
 #include "consensus/babe/babe_error.hpp"
+#include "consensus/babe/impl/"
+#include "consensus/babe/impl/babe_digests_util.hpp"
 #include "consensus/babe/types/babe_block_header.hpp"
 #include "consensus/babe/types/seal.hpp"
 #include "network/types/block_announce.hpp"
@@ -19,6 +21,10 @@
 
 namespace kagome::consensus {
   BabeImpl::BabeImpl(std::shared_ptr<BabeLottery> lottery,
+                     std::shared_ptr<BabeSynchronizer> babe_synchronizer,
+                     std::shared_ptr<BabeBlockValidator> block_validator,
+                     std::shared_ptr<EpochStorage> epoch_storage,
+                     std::shared_ptr<runtime::Core> core,
                      std::shared_ptr<authorship::Proposer> proposer,
                      std::shared_ptr<blockchain::BlockTree> block_tree,
                      std::shared_ptr<network::BabeGossiper> gossiper,
@@ -29,6 +35,10 @@ namespace kagome::consensus {
                      std::unique_ptr<clock::Timer> timer,
                      libp2p::event::Bus &event_bus)
       : lottery_{std::move(lottery)},
+        babe_synchronizer_{std::move(babe_synchronizer)},
+        block_validator_{std::move(block_validator)},
+        epoch_storage_{std::move(epoch_storage)},
+        core_{std::move(core)},
         proposer_{std::move(proposer)},
         block_tree_{std::move(block_tree)},
         gossiper_{std::move(gossiper)},
@@ -57,7 +67,9 @@ namespace kagome::consensus {
 
     current_epoch_ = std::move(epoch);
     current_slot_ = current_epoch_.start_slot;
-    slots_leadership_ = lottery_->slotsLeadership(current_epoch_, keypair_);
+
+    auto threshold = slots_leadership_ = lottery_->slotsLeadership(
+        current_epoch_.randomness, genesis_configuration_., keypair_);
     next_slot_finish_time_ = starting_slot_finish_time;
 
     runSlot();
@@ -74,7 +86,7 @@ namespace kagome::consensus {
     using std::chrono::operator""ms;
     static constexpr auto kMaxLatency = 5000ms;
 
-    if (current_slot_ == current_epoch_.epoch_duration) {
+    if (current_slot_ % genesis_configuration_.epoch_length == 0) {
       // end of the epoch
       return finishEpoch();
     }
@@ -90,7 +102,9 @@ namespace kagome::consensus {
         && (now - next_slot_finish_time_ > kMaxLatency)) {
       // we are too far behind; after skipping some slots (but not epochs)
       // control will be returned to this method
-      return synchronizeSlots();
+
+      // TODO
+      return synchronizeBlocks();
     }
 
     // everything is OK: wait for the end of the slot
@@ -113,7 +127,7 @@ namespace kagome::consensus {
     }
 
     ++current_slot_;
-    next_slot_finish_time_ += current_epoch_.slot_duration;
+    next_slot_finish_time_ += genesis_configuration_.slot_duration;
     log_->debug("Slot {} in epoch {} has finished",
                 current_slot_,
                 current_epoch_.epoch_index);
@@ -131,7 +145,7 @@ namespace kagome::consensus {
     }
     common::Buffer encoded_header{encoded_header_res.value()};
 
-    return primitives::PreRuntime{{kBabeEngineId, encoded_header}};
+    return primitives::PreRuntime{{primitives::kBabeEngineId, encoded_header}};
   }
 
   primitives::Seal BabeImpl::sealBlock(const primitives::Block &block) const {
@@ -147,7 +161,7 @@ namespace kagome::consensus {
                  pre_seal_hash.data(),
                  decltype(pre_seal_hash)::size());
     auto encoded_seal = common::Buffer(scale::encode(seal).value());
-    return primitives::Seal{{kBabeEngineId, encoded_seal}};
+    return primitives::Seal{{primitives::kBabeEngineId, encoded_seal}};
   }
 
   void BabeImpl::processSlotLeadership(const crypto::VRFOutput &output) {
@@ -216,40 +230,146 @@ namespace kagome::consensus {
     // (BabeApi_slot_winning_threshold runtime entry)
 
     // compute new randomness
-    current_epoch_.randomness = lottery_->computeRandomness(
-        current_epoch_.randomness, ++current_epoch_.epoch_index);
-    current_epoch_.start_slot = 0;
+    const auto &next_epoch_digest_opt =
+        epoch_storage_->getEpochDescriptor(++current_epoch_.epoch_index);
+    if (not next_epoch_digest_opt) {
+      log_->error("Next epoch digest does not exist");
+      return;
+    }
+
+    current_epoch_.authorities = next_epoch_digest_opt->authorities;
+    current_epoch_.randomness = next_epoch_digest_opt->randomness;
 
     log_->debug("Epoch {} has finished", current_epoch_.epoch_index);
     runEpoch(current_epoch_, next_slot_finish_time_);
   }
 
-  void BabeImpl::synchronizeSlots() {
-    // assuming we are too far behind other peers (now() >> finishing time of
-    // the last known slot), we compute, how much slots we should skip; if this
-    // would require us to move through the epochs, it becomes problematic, as
-    // many things are to be updated on the epochs' borders, and we don't have
-    // enough information; give up in that case
-    log_->info("trying to synchronize our node with the others");
-
-    auto delay_in_time = clock_->now() - next_slot_finish_time_;
-
-    // result of the division can be both integer or float number; in both
-    // cases, we want that number to be incremented by one, so that after the
-    // sync the time would point on the finishing time of the next slot
-    auto delay_in_slots =
-        std::floor(delay_in_time / current_epoch_.slot_duration);
-    ++delay_in_slots;
-
-    if (current_slot_ + delay_in_slots >= current_epoch_.epoch_duration) {
-      log_->error("the node is too far behind");
-      return error_channel_.publish(BabeError::NODE_FALL_BEHIND);
+  void BabeImpl::processNextBlock(const primitives::Block &new_block) {
+    if (auto apply_res = applyBlock(new_block); not apply_res) {
+      log_->error("Could not apply block during synchronizing slots. Error: {}",
+                  apply_res.error().message());
     }
 
-    // everything is OK: skip slots, set a new time and return control
-    current_slot_ += delay_in_slots - 1;
-    next_slot_finish_time_ += std::chrono::milliseconds(
-        static_cast<uint64_t>(delay_in_slots) * current_epoch_.slot_duration);
-    runSlot();
+    auto babe_digests_res = getBabeDigests(new_block.header);
+    if (not babe_digests_res) {
+      log_->error("Could not get digests: {}",
+                  babe_digests_res.error().message());
+    }
+
+    auto [_, babe_header] = babe_digests_res.value();
+    auto observed_slot = babe_header.slot_number;
+
+    auto epoch_index = genesis_configuration_.epoch_length;
+
+    // update authorities and randomnesss
+    auto next_epoch_digest_res = getNextEpochDigest(new_block.header);
+    if (not next_epoch_digest_res) {
+      return;
+    }
+    epoch_storage_->addEpochDescriptor(epoch_index,
+                                       next_epoch_digest_res.value());
+  }
+
+  Epoch BabeImpl::epochForChildOf(const primitives::BlockHash &parent_hash,
+                                  primitives::BlockNumber parent_number,
+                                  BabeSlotNumber slot_number) const {}
+
+  void BabeImpl::synchronizeSlots(const primitives::Block &new_block) {
+    static boost::optional<BabeSlotNumber> first_production_slot = boost::none;
+
+    if (auto apply_res = applyBlock(new_block); not apply_res) {
+      log_->error("Could not apply block during synchronizing slots. Error: {}",
+                  apply_res.error().message());
+    }
+
+    auto babe_digests_res = getBabeDigests(new_block.header);
+    if (not babe_digests_res) {
+      log_->error("Could not get digests: {}",
+                  babe_digests_res.error().message());
+    }
+
+    auto [_, babe_header] = babe_digests_res.value();
+    auto observed_slot = babe_header.slot_number;
+
+    if (not first_production_slot) {
+      first_production_slot = observed_slot + kSlotTail;
+    }
+
+    // get the difference between observed slot and the one that we are trying
+    // to launch
+    auto diff = *first_production_slot - observed_slot;
+
+    first_slot_times_.emplace_back(
+        clock_->nowUint64() + diff * genesis_configuration_.slot_duration);
+    if (observed_slot >= first_production_slot.value()) {
+      current_state_ = BabeState::SYNCHRONIZED;
+
+      // get median as here:
+      // https://en.cppreference.com/w/cpp/algorithm/nth_element
+      std::nth_element(first_slot_times_.begin(),
+                       first_slot_times_.begin() + first_slot_times_.size() / 2,
+                       first_slot_times_.end());
+      auto first_slot_ending_time =
+          first_slot_times_[first_slot_times_.size() / 2];
+
+      Epoch epoch;
+      epoch.epoch_index =
+          *first_production_slot / genesis_configuration_.epoch_length;
+      epoch.start_slot = *first_production_slot;
+      epoch.epoch_duration = genesis_configuration_.epoch_length;
+
+      // fill other epoch fields
+      runEpoch(epoch, first_slot_ending_time);
+    }
+  }
+
+  void BabeImpl::synchronizeBlocks(const primitives::Block &new_block,
+                                   std::function<void()> next) {
+    const auto &[last_number, last_hash] = block_tree_->getLastFinalized();
+    BOOST_ASSERT(new_block.header.number <= last_number);
+    babe_synchronizer_->request(
+        new_block.header.parent_hash,
+        last_hash,
+        [self{shared_from_this()}, next{std::move(next)}, new_block](
+            const std::vector<primitives::Block> &blocks) {
+          for (const auto &block : boost::join(blocks, new_block)) {
+            if (auto apply_res = self->applyBlock(block); not apply_res) {
+              self->log_->error("Could not apply block: {}",
+                                apply_res.error().message());
+              return;
+            }
+          }
+          next();
+        });
+  }
+
+  outcome::result<void> BabeImpl::applyBlock(const primitives::Block &block) {
+    // TODO(kamilsa): validate block
+    // if (auto validate_res = block_validator_->validate(block))
+
+    // apply block
+    OUTCOME_TRY(core_->execute_block(block));
+    OUTCOME_TRY(block_tree_->addBlock(block));
+
+    return outcome::success();
+  }
+
+  void BabeImpl::onBlockAnnounce(const network::BlockAnnounce &announce) {
+    switch (current_state_) {
+      case BabeState::START:
+        current_state_ = BabeState::CATCHING_UP;
+        synchronizeBlocks(announce.block, [self{shared_from_this()}] {
+          // all blocks were successfully applied, now we need to get slot time
+          self->current_state_ = BabeState::NEED_SLOT_TIME;
+        });
+        break;
+      case BabeState::NEED_SLOT_TIME:
+        synchronizeSlots(announce.block);
+        break;
+      case BabeState::CATCHING_UP:
+      case BabeState::SYNCHRONIZED:
+        processNextBlock(announce.block);
+        break;
+    }
   }
 }  // namespace kagome::consensus

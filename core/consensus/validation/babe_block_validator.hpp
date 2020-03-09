@@ -50,7 +50,6 @@ namespace kagome::consensus {
 
     enum class ValidationError {
       NO_AUTHORITIES = 1,
-      INVALID_DIGESTS,
       INVALID_SIGNATURE,
       INVALID_VRF,
       TWO_BLOCKS_IN_SLOT,

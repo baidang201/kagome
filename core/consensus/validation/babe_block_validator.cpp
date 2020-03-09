@@ -9,6 +9,7 @@
 #include <boost/assert.hpp>
 
 #include "common/mp_utils.hpp"
+#include "consensus/babe/impl/babe_digests_util.hpp"
 #include "crypto/sr25519_provider.hpp"
 #include "scale/scale.hpp"
 
@@ -19,8 +20,6 @@ OUTCOME_CPP_DEFINE_CATEGORY(kagome::consensus,
   switch (e) {
     case E::NO_AUTHORITIES:
       return "no authorities are provided for the validation";
-    case E::INVALID_DIGESTS:
-      return "the block does not contain valid BABE digests";
     case E::INVALID_SIGNATURE:
       return "SR25519 signature, which is in BABE header, is invalid";
     case E::INVALID_VRF:
@@ -91,52 +90,6 @@ namespace kagome::consensus {
     // specified as a parent of the block we are validating; BlockTree takes
     // care of this check and returns a specific error, if it fails
     return outcome::success();
-  }
-
-  template <typename T, typename VarT>
-  boost::optional<T> getFromVariant(VarT &&v) {
-    return visit_in_place(
-        v,
-        [](const T &expected_val) -> boost::optional<T> {
-          return boost::get<T>(expected_val);
-        },
-        [](const auto &) -> boost::optional<T> { return boost::none; });
-  }
-
-  outcome::result<std::pair<Seal, BabeBlockHeader>>
-  BabeBlockValidator::getBabeDigests(const primitives::Block &block) const {
-    // valid BABE block has at least two digests: BabeHeader and a seal
-    if (block.header.digest.size() < 2) {
-      log_->info(
-          "valid BABE block must have at least 2 digests, this one have {}",
-          block.header.digest.size());
-      return ValidationError::INVALID_DIGESTS;
-    }
-    const auto &digests = block.header.digest;
-
-    // last digest of the block must be a seal - signature
-    auto seal_res = getFromVariant<primitives::Seal>(digests.back());
-    if (!seal_res) {
-      log_->info("last digest of the block is not a Seal");
-      return ValidationError::INVALID_DIGESTS;
-    }
-
-    OUTCOME_TRY(babe_seal_res, scale::decode<Seal>(seal_res.value().data));
-
-    for (const auto &digest :
-         gsl::make_span(digests).subspan(0, digests.size() - 1)) {
-      if (auto consensus_dig = getFromVariant<primitives::PreRuntime>(digest);
-          consensus_dig) {
-        if (auto header = scale::decode<BabeBlockHeader>(consensus_dig->data);
-            header) {
-          // found the BabeBlockHeader digest; return
-          return {babe_seal_res, header.value()};
-        }
-      }
-    }
-
-    log_->warn("there is no BabeBlockHeader digest in the block");
-    return ValidationError::INVALID_DIGESTS;
   }
 
   bool BabeBlockValidator::verifySignature(

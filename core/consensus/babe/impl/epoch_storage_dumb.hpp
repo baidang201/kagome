@@ -6,9 +6,8 @@
 #ifndef KAGOME_EPOCH_STORAGE_DUMB_HPP
 #define KAGOME_EPOCH_STORAGE_DUMB_HPP
 
-#include <memory>
+#include <unordered_map>
 
-#include "consensus/babe.hpp"
 #include "consensus/babe/epoch_storage.hpp"
 
 namespace kagome::consensus {
@@ -18,15 +17,16 @@ namespace kagome::consensus {
    */
   class EpochStorageDumb : public EpochStorage {
    public:
-    explicit EpochStorageDumb(std::shared_ptr<Babe> babe);
-
     ~EpochStorageDumb() override = default;
 
-    boost::optional<Epoch> getEpoch(
-        const primitives::BlockId &block_id) const override;
+    void addEpochDescriptor(EpochIndex epoch_number,
+                            NextEpochDescriptor epoch_descriptor) override;
+
+    boost::optional<NextEpochDescriptor> getEpochDescriptor(
+        EpochIndex epoch_number) const override;
 
    private:
-    std::shared_ptr<Babe> babe_;
+    std::unordered_map<EpochIndex, NextEpochDescriptor> epoch_map_{};
   };
 }  // namespace kagome::consensus
 

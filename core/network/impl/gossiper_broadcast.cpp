@@ -24,7 +24,7 @@ namespace kagome::network {
 
   void GossiperBroadcast::blockAnnounce(const BlockAnnounce &announce) {
     logger_->info("Gossip block announce: block number {}",
-                  announce.header.number);
+                  announce.block.number);
     GossipMessage message;
     message.type = GossipMessage::Type::BLOCK_ANNOUNCE;
     message.data.put(scale::encode(announce).value());

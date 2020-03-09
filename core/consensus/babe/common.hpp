@@ -6,7 +6,6 @@
 #ifndef KAGOME_COMMON_HPP
 #define KAGOME_COMMON_HPP
 
-#include <array>
 #include <cstdint>
 
 #include "clock/clock.hpp"
@@ -26,8 +25,7 @@ namespace kagome::consensus {
   using Threshold = crypto::VRFThreshold;
 
   /// random value, which serves as a seed for VRF slot leadership selection
-  using Randomness =
-      std::array<uint8_t, crypto::constants::sr25519::vrf::OUTPUT_SIZE>;
+  using Randomness = common::Blob<crypto::constants::sr25519::vrf::OUTPUT_SIZE>;
 }  // namespace kagome::consensus
 
 #endif  // KAGOME_COMMON_HPP

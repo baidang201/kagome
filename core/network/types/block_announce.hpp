@@ -6,14 +6,18 @@
 #ifndef KAGOME_BLOCK_ANNOUNCE_HPP
 #define KAGOME_BLOCK_ANNOUNCE_HPP
 
-#include "primitives/block_header.hpp"
+#include "primitives/block.hpp"
 
 namespace kagome::network {
   /**
    * Announce a new complete block on the network
    */
   struct BlockAnnounce {
-    primitives::BlockHeader header;
+    // TODO(kamilsa): uncomment. We should broadcast block headers according
+    // to spec. However, this might be changed
+    //
+    // primitives::BlockHeader block;
+    primitives::Block block;
   };
 
   /**
@@ -23,7 +27,7 @@ namespace kagome::network {
    * @return true if equal false otherwise
    */
   inline bool operator==(const BlockAnnounce &lhs, const BlockAnnounce &rhs) {
-    return lhs.header == rhs.header;
+    return lhs.block == rhs.block;
   }
   inline bool operator!=(const BlockAnnounce &lhs, const BlockAnnounce &rhs) {
     return !(lhs == rhs);
@@ -39,7 +43,7 @@ namespace kagome::network {
   template <class Stream,
             typename = std::enable_if_t<Stream::is_encoder_stream>>
   Stream &operator<<(Stream &s, const BlockAnnounce &v) {
-    return s << v.header;
+    return s << v.block;
   }
 
   /**
@@ -52,7 +56,7 @@ namespace kagome::network {
   template <class Stream,
             typename = std::enable_if_t<Stream::is_decoder_stream>>
   Stream &operator>>(Stream &s, BlockAnnounce &v) {
-    return s >> v.header;
+    return s >> v.block;
   }
 }  // namespace kagome::network
 

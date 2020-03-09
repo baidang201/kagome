@@ -190,6 +190,7 @@ namespace kagome::consensus::grandpa {
     if (completable() and clock_->now() < prevote_timer_.expires_at()) {
       prevote_timer_.cancel();
     }
+    tryFinalize();
   }
 
   void VotingRoundImpl::onPrecommit(const SignedPrecommit &precommit) {

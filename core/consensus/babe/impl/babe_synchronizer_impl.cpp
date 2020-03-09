@@ -3,36 +3,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "consensus/babe/impl/babe_observer_impl.hpp"
+#include "consensus/babe/impl/babe_synchronizer_impl.hpp"
 
 #include <boost/assert.hpp>
 #include "blockchain/block_tree_error.hpp"
 #include "primitives/block.hpp"
 
 namespace kagome::consensus {
-  BabeObserverImpl::BabeObserverImpl(
-      std::shared_ptr<BlockValidator> validator,
-      std::shared_ptr<network::SyncClientsSet> sync_clients,
-      std::shared_ptr<blockchain::BlockTree> tree,
-      std::shared_ptr<EpochStorage> epoch_storage,
-      std::shared_ptr<runtime::Core> core)
-      : validator_{std::move(validator)},
-        sync_clients_{std::move(sync_clients)},
-        tree_{std::move(tree)},
-        epoch_storage_{std::move(epoch_storage)},
-        core_{std::move(core)},
+  BabeSynchronizerImpl::BabeSynchronizerImpl(
+      std::shared_ptr<network::SyncClientsSet> sync_clients)
+      : sync_clients_{std::move(sync_clients)},
         logger_{common::createLogger("BabeObserver")} {
-    BOOST_ASSERT(validator_);
     BOOST_ASSERT(sync_clients_);
-    BOOST_ASSERT(tree_);
     BOOST_ASSERT(std::all_of(sync_clients_->clients.begin(),
                              sync_clients_->clients.end(),
                              [](const auto &client) { return client; }));
-    BOOST_ASSERT(core_);
-    BOOST_ASSERT(epoch_storage_);
   }
 
-  void BabeObserverImpl::onBlockAnnounce(
+  /*
+  void BabeSynchronizerImpl::onBlockAnnounce(
       const network::BlockAnnounce &announce) const {
     // maybe later it will be consensus message with a body
     primitives::Block block{announce.header};
@@ -99,14 +88,15 @@ namespace kagome::consensus {
                                    network::Direction::DESCENDING,
                                    boost::none};
 
-    pollClients(block, request, decltype(sync_clients_->clients)());
-  }
+    pollClients(request, decltype(sync_clients_->clients)());
+  }*/
 
-  void BabeObserverImpl::pollClients(
-      primitives::Block block_to_insert,
+  void BabeSynchronizerImpl::pollClients(
       network::BlocksRequest request,
       std::unordered_set<std::shared_ptr<network::SyncProtocolClient>>
-          &&polled_clients) const {
+          &&polled_clients,
+      std::function<void(const std::vector<primitives::Block>)>
+          &&requested_blocks_handler) const {
     // we want to ask each client until we get the blocks we lack, but the
     // sync_clients_ set can change between the requests, so we need to keep
     // track of the clients we already asked
@@ -129,15 +119,15 @@ namespace kagome::consensus {
     next_client->blocksRequest(
         request,
         [self{shared_from_this()},
-         block_to_insert{std::move(block_to_insert)},
          request{std::move(request)},
-         polled_clients{std::move(polled_clients)}](
+         polled_clients{std::move(polled_clients)},
+         requested_blocks_handler{std::move(requested_blocks_handler)}](
             auto &&response_res) mutable {
           if (!response_res) {
             // proceed to the next client
-            return self->pollClients(std::move(block_to_insert),
-                                     std::move(request),
-                                     std::move(polled_clients));
+            return self->pollClients(std::move(request),
+                                     std::move(polled_clients),
+                                     std::move(requested_blocks_handler));
           }
           auto response = std::move(response_res.value());
 
@@ -145,6 +135,7 @@ namespace kagome::consensus {
           // also add them to the tree; if any of them fails, we should proceed
           // to the next client
           auto success = true;
+          std::vector<primitives::Block> blocks;
           for (const auto &block_data : response.blocks) {
             primitives::Block block;
             if (!block_data.header) {
@@ -159,52 +150,28 @@ namespace kagome::consensus {
               block.body = *block_data.body;
             }
 
-            auto epoch_opt =
-                self->epoch_storage_->getEpoch(block.header.number);
-            if (!epoch_opt) {
-              // not clear, what to do, as in the upper method
-              success = false;
-              break;
-            }
-
-            if (!self->validator_->validate(block, *epoch_opt)) {
-              // validation failed, so we cannot proceed
-              success = false;
-              break;
-            }
-
-            // block is good to be added
-            if (auto insert_res = self->tree_->addBlock(block);
-                not insert_res) {
-              success = false;
-              break;
-            }
-            if (auto execute_res = self->core_->execute_block(block);
-                not execute_res) {
-              success = false;
-              break;
-            }
+            blocks.push_back(block);
           }
 
           if (!success) {
             // proceed to the next client
-            return self->pollClients(std::move(block_to_insert),
-                                     std::move(request),
-                                     std::move(polled_clients));
+            return self->pollClients(std::move(request),
+                                     std::move(polled_clients),
+                                     std::move(requested_blocks_handler));
           }
 
-          // we have inserted all blocks that were needed for the one we
-          // received; try to insert it again
-          auto insert_res = self->tree_->addBlock(block_to_insert);
-          if (!insert_res) {
-            // something very bad happened
-            return;
-          }
-          if (auto execute_res = self->core_->execute_block(block_to_insert);
-              not execute_res) {
-            // handle error
-            return;
-          }
+          requested_blocks_handler(blocks);
         });
+  }
+  void BabeSynchronizerImpl::request(const primitives::BlockHash &from,
+                                     const primitives::BlockHash &to,
+                                     BlocksHandler &&block_list_handler) {
+    network::BlocksRequest request{network::BlocksRequest::kBasicAttributes,
+                                   from,
+                                   to,
+                                   network::Direction::DESCENDING,
+                                   boost::none};
+
+    return pollClients(request, {}, std::move(block_list_handler));
   }
 }  // namespace kagome::consensus
